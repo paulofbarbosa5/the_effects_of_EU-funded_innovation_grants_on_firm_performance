@@ -177,7 +177,6 @@ df_analysis3_innov <- df_analysis2 %>%
 # NOTE: We assume you provide a `pre_feats` data.frame upstream with columns:
 # tina, treated (0/1), t0 (first treatment year), pre_lsales, pre_emp, pre_expint,
 # pre_lassets, sl_lsales, setor2, firm_size0 (baseline size class), etc.
-# The block below only cleans/imputes those features and runs PSM.
 
 set.seed(42)
 
@@ -256,13 +255,13 @@ process_weights <- function(match_obj, df_main, w_name = "w_psm"){
 df_w_psm <- process_weights(m_psm_robust, df_analysis3_innov, w_name = "w_psm")
 
 # *********************************************************
-#        Event-study (Sun & Abraham) – Panels A–C only     #
+#        Event-study (Sun & Abraham) – Panels A–C         #
 # *********************************************************
 
 run_export_sunab <- function(dat, wvar, prefix, results_tables, results_figures){
   wcall <- as.formula(paste0("~", wvar))
 
-  # === PANELS (exact names kept) ===
+  # === PANELS  ===
   # Panel A: K/L (log)
   didlKL <- feols(log(kl_ratio) ~ sunab(inov_ano_inc, ano) | tina + ano + district + setor2,
                   data = dat, vcov = ~tina, weights = wcall)
@@ -309,13 +308,11 @@ run_export_sunab <- function(dat, wvar, prefix, results_tables, results_figures)
   save_iplot(didlLaborProd, paste0("didlLaborProd_PT_plot_", prefix, ".png"))
 }
 
-# Run (PSM only)
+# Run (PSM)
 run_export_sunab(df_w_psm, "w_psm", "psm", results_tables, results_figures)
 
 # *********************************************************
 #                   Descriptive Statistics                 #
-#  (kept as in your workflow; you can trim further if you  #
-#   only want the table exports by treatment/year.)        #
 # *********************************************************
 
 # The block below summarizes firm size and export participation; keep or trim.

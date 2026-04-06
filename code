@@ -1,1 +1,769 @@
+# =============================================================================
+# Project      : p191_BarbosaAmador  
+# Description  : Script producing outputs for Essay 3:
+#                Panel A (all non-treated), Panel B (rejected only),
+#                Panel C (PSM), EBAL, descriptive tables, event-study plots.
+# =============================================================================
 
+# *********************************************************
+#                     Initialization                      #
+# *********************************************************
+
+rm(list = ls())
+source("config.R")
+
+library(dplyr)
+library(lubridate)
+library(fixest)
+library(ggplot2)
+library(modelsummary)
+library(tinytable)
+library(broom)
+library(knitr)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(haven)
+library(WeightIt)
+library(MatchIt)
+library(cobalt)
+library(scales)
+
+setwd(path_rep)
+
+# Output directories
+results        <- file.path(path_rep, "results")
+results_tables <- file.path(results, "tables")
+results_figures <- file.path(results, "figures")
+dir.create(results,        recursive = TRUE, showWarnings = FALSE)
+dir.create(results_tables, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_figures, recursive = TRUE, showWarnings = FALSE)
+
+# Log
+sink(file.path(path_rep, "my_R.log"), split = TRUE)
+
+cat("=== Essay 3 consolidated script ===\n")
+cat("Date:", as.character(Sys.time()), "\n")
+cat("R version:", paste(R.version$major, R.version$minor, sep = "."), "\n\n")
+
+# *********************************************************
+#               1. Import and merge data                  #
+# *********************************************************
+
+cat("--- 1. Importing data ---\n")
+
+# IES panel (2014-2022)
+ies_files <- file.path(paths$source,
+                       paste0("PM191_CB_A_YFRM_", 2014:2022, "_JUN25_COMB_V01.dta"))
+combined_ies <- bind_rows(lapply(ies_files, read_dta))
+cat("  IES panel rows:", nrow(combined_ies), "\n")
+
+# GE (foreign direct investment)
+GE <- read_dta(file.path(paths$source,
+                         "GE_A_YFRM_20142022_JAN24_PART_V01.dta")) %>%
+  group_by(tina_participante, ano) %>%
+  summarise(invdir = as.integer(sum(invdir) > 0), .groups = "drop")
+
+df_iesGE <- left_join(combined_ies, GE,
+                      by = c("ano" = "ano", "tina" = "tina_participante"))
+
+# Incentives data
+df_p2 <- read_dta(file.path(paths$source_p,
+                            sprintf("PM191_%s_incentivos2020.dta", M2)))
+
+filtered_dfp <- df_p2 %>%
+  filter(regime == 1) %>%
+  mutate(
+    sample = ifelse(!is.na(cnt_dt_inicio) &
+                      cnt_dt_inicio != as.Date("1900-01-01") &
+                      dec_ult_sentido_decisao == 71, 1L, 2L),
+    ano         = ifelse(year(cnt_dt_inicio) > 1900, year(cnt_dt_inicio), NA_integer_),
+    ano_control = ifelse(year(data_cand) > 1900, year(data_cand), NA_integer_)
+  )
+
+# *********************************************************
+#               2. Build cohorts                          #
+# *********************************************************
+
+cat("--- 2. Building cohorts ---\n")
+
+# Treated: first award year, max gap < 3 (at most 2 consecutive years)
+treated <- filtered_dfp %>%
+  filter(sample == 1L) %>%
+  group_by(tina) %>%
+  arrange(ano, .by_group = TRUE) %>%
+  mutate(gap = ano - dplyr::lag(ano)) %>%
+  summarise(
+    max_gap  = coalesce(max(gap, na.rm = TRUE), 0),
+    inov_ano = min(ano, na.rm = TRUE),
+    inov_inc = sum(dec_ult_valor_inc, na.rm = TRUE),
+    inov_inv = sum(dec_ult_valor_inv, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  filter(max_gap < 3) %>%
+  mutate(sample = 1L)
+
+# Rejected applicants
+applied_not_treated <- filtered_dfp %>%
+  filter(sample == 2L) %>%
+  group_by(tina) %>%
+  summarise(
+    inov_ano = min(ano_control, na.rm = TRUE),
+    inov_inc = sum(dec_ult_valor_inc, na.rm = TRUE),
+    sample   = 2L,
+    .groups  = "drop"
+  )
+
+# Never-applicants
+never <- anti_join(
+  combined_ies %>% distinct(tina),
+  bind_rows(treated %>% distinct(tina),
+            applied_not_treated %>% distinct(tina)),
+  by = "tina"
+) %>%
+  mutate(inov_ano = NA_integer_, sample = 3L)
+
+cohorts <- bind_rows(treated, applied_not_treated, never) %>%
+  distinct(tina, .keep_all = TRUE)
+
+cat("  Treated firms:", sum(cohorts$sample == 1), "\n")
+cat("  Rejected applicants:", sum(cohorts$sample == 2), "\n")
+cat("  Never-applicants:", sum(cohorts$sample == 3), "\n")
+
+# *********************************************************
+#               3. Build analysis panel                   #
+# *********************************************************
+
+cat("--- 3. Building analysis panel ---\n")
+
+df_analysis <- left_join(df_iesGE, cohorts, by = "tina")
+
+# --- Helper ---
+safe_ratio <- function(num, den) {
+  ifelse(is.finite(num) & is.finite(den) & den > 0, num / den, NA_real_)
+}
+
+# External data: municipality-to-district mapping
+dfe <- read_dta(file.path(paths$source_e, "concelhosCodigos.dta")) %>%
+  rename(consCod = Código_Concelho, distCod = Código_Distrito) %>%
+  group_by(consCod) %>%
+  summarise(distCod = max(distCod), .groups = "drop") %>%
+  mutate(consCod = as.numeric(consCod))
+
+# District lookup table 
+dist_map <- tibble(
+  distCod = c(1:18, 19:28, 32, 41:49),
+  district = c(sprintf("%02d", 1:18),
+               sprintf("%02d", 19:28),
+               "30", rep("40", 9))
+)
+
+df_analysis2 <- df_analysis %>%
+  mutate(
+    # --- FIX: age varies with year ---
+    idade     = ifelse(ano - ancon > 130 | ano - ancon < 0, NA_integer_, ano - ancon),
+    concelho  = as.numeric(concelho),
+    inov_inc  = ifelse(is.na(inov_inc), 0, inov_inc),
+    # --- Exports ---
+    totExports = rowSums(cbind(
+      ifelse(is.na(VF15620), 0, VF15620),
+      ifelse(is.na(VF15621), 0, VF15621),
+      ifelse(is.na(VF15624), 0, VF15624),
+      ifelse(is.na(VF15625), 0, VF15625)
+    )),
+    totExports_produtos = rowSums(cbind(
+      ifelse(is.na(VF15620), 0, VF15620),
+      ifelse(is.na(VF15621), 0, VF15621)
+    )),
+    # --- FIX: int_export stays CONTINUOUS (not logical) ---
+    int_export = ifelse(VF16132 > 0, totExports / VF16132, 0),
+    # --- Other variables ---
+    employess = VF15532,
+    setor3    = substr(cae21, 1, 3),
+    setor2    = substr(cae21, 1, 2),
+    # --- Fixed assets (vectorized, no rowwise) ---
+    fixed_assets = rowSums(cbind(
+      ifelse(is.na(VF15637), 0, VF15637),
+      ifelse(is.na(VF15636), 0, VF15636),
+      ifelse(is.na(VF15635), 0, VF15635)
+    )),
+    # --- Firm size ---
+    firm_size = case_when(
+      VF15532 < 10  & VF16132 <= 2e6  ~ "micro",
+      VF15532 < 50  & VF16132 <= 1e7  ~ "small",
+      VF15532 < 250 & VF16132 <= 5e7  ~ "medium",
+      TRUE                            ~ "large"
+    ),
+    firm_size = factor(firm_size, levels = c("micro", "small", "medium", "large")),
+    sample    = ifelse(is.na(sample), 3L, sample)
+  ) %>%
+  rename(inov_ano_inc = inov_ano) %>%
+  # District join
+  left_join(dfe, by = c("concelho" = "consCod")) %>%
+  left_join(dist_map, by = "distCod") %>%
+  mutate(district = ifelse(is.na(district), "99", district),
+         district = factor(district)) %>%
+  # Ratios (require >= 3 employees)
+  mutate(
+    employess_pos = ifelse(employess >= 3, employess, NA_real_),
+    kl_ratio      = safe_ratio(fixed_assets, employess_pos),
+    labor_prod    = safe_ratio(VF16132, employess_pos),
+    wages_head    = safe_ratio(VF15557, employess_pos)
+  )
+
+cat("  Panel rows:", nrow(df_analysis2), "\n")
+
+# *********************************************************
+#         4. Deflator and descriptive statistics          #
+# *********************************************************
+
+cat("--- 4. Descriptive statistics ---\n")
+
+deflator <- tribble(
+  ~ano, ~deflator_2015,
+  2014, 0.99403,
+  2015, 1.00000,
+  2016, 1.00597,
+  2017, 1.01429,
+  2018, 1.02267,
+  2019, 1.03860,
+  2020, 1.08654,
+  2021, 1.11259,
+  2022, 1.13869
+)
+
+value_cols <- c("totExports", "totExports_produtos", "fixed_assets",
+                "VF15557", "VF16215", "VF15569", "inov_inc", "VF16132")
+
+descriptive <- df_analysis2 %>%
+  select(tina, ano, inov_ano_inc, sample, all_of(value_cols),
+         VF17750, VF16371, VF16338, VF15533, VF15550, int_export, employess) %>%
+  left_join(deflator, by = "ano") %>%
+  mutate(across(all_of(value_cols),
+                ~ .x / deflator_2015,
+                .names = "{.col}_real2015"))
+
+# --- Table 3.9: Innovation subsidies by year ---
+incentives_year <- descriptive %>%
+  filter(sample == 1) %>%
+  mutate(inov_inc_real2015 = inov_inc_real2015 / 1000) %>%
+  filter(inov_ano_inc == ano) %>%
+  group_by(ano) %>%
+  summarise(
+    total  = sum(inov_inc_real2015, na.rm = TRUE),
+    mean   = mean(inov_inc_real2015, na.rm = TRUE),
+    median = median(inov_inc_real2015, na.rm = TRUE),
+    sd     = sd(inov_inc_real2015, na.rm = TRUE),
+    n_firms = n(),
+    .groups = "drop"
+  )
+
+write.csv(incentives_year, file.path(results_tables, "table_3_9_incentives_year.csv"),
+          row.names = FALSE)
+cat("  Table 3.9 saved.\n")
+
+# --- Table 3.10: Baseline differences ---
+desc_base <- df_analysis2 %>%
+  left_join(deflator, by = "ano") %>%
+  mutate(
+    assets_real           = safe_ratio(fixed_assets, deflator_2015),
+    sales_real            = safe_ratio(VF16132, deflator_2015),
+    kl_ratio_real         = safe_ratio(assets_real, employess),
+    labor_prod_real       = safe_ratio(sales_real, employess),
+    wages_head_real       = safe_ratio(VF15557 / deflator_2015, employess),
+    totExports_real       = totExports / deflator_2015,
+    VF15569_real          = VF15569 / deflator_2015,
+    VF15557_real          = VF15557 / deflator_2015
+  )
+
+vars_table10 <- c("idade", "assets_real", "sales_real", "employess",
+                   "kl_ratio_real", "labor_prod_real", "VF15569_real",
+                   "wages_head_real", "int_export", "totExports_real")
+
+var_labels_10 <- c(
+  idade           = "Firm Age",
+  assets_real     = "Assets",
+  sales_real      = "Sales",
+  employess       = "Employment",
+  kl_ratio_real   = "K-L ratio",
+  labor_prod_real = "Labour productivity",
+  VF15569_real    = "Training expenses",
+  wages_head_real = "Wage per head",
+  int_export      = "Export intensity",
+  totExports_real = "Total exports"
+)
+
+# Slices
+never_all <- desc_base %>% filter(sample == 3)
+pre_app <- desc_base %>%
+  filter(sample %in% c(1, 2), !is.na(inov_ano_inc)) %>%
+  filter(ano == inov_ano_inc - 1L)
+
+summ_mean_sd <- function(df, vars) {
+  tibble(variable = vars) %>%
+    mutate(
+      mean = map_dbl(variable, ~ mean(df[[.x]], na.rm = TRUE)),
+      sd   = map_dbl(variable, ~ sd(df[[.x]], na.rm = TRUE)),
+      label = sprintf("%.3f (%.3f)", mean, sd)
+    )
+}
+
+tab_never    <- summ_mean_sd(never_all, vars_table10)
+tab_rejected <- summ_mean_sd(pre_app %>% filter(sample == 2), vars_table10)
+tab_winner   <- summ_mean_sd(pre_app %>% filter(sample == 1), vars_table10)
+
+ttest_WR <- pre_app %>%
+  select(sample, all_of(vars_table10)) %>%
+  pivot_longer(all_of(vars_table10), names_to = "variable", values_to = "value") %>%
+  filter(is.finite(value)) %>%
+  group_by(variable) %>%
+  summarise(
+    diff_WR = mean(value[sample == 1], na.rm = TRUE) -
+      mean(value[sample == 2], na.rm = TRUE),
+    p_value = tryCatch(
+      t.test(value ~ factor(sample, levels = c(2, 1)), var.equal = FALSE)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  )
+
+table_3_10 <- tibble(
+  Variable        = var_labels_10[vars_table10],
+  `Never apl.`    = tab_never$label,
+  Rejected        = tab_rejected$label,
+  Winner          = tab_winner$label
+) %>%
+  left_join(ttest_WR %>% transmute(Variable = var_labels_10[variable],
+                                    `Winner - Rejected` = sprintf("%.3f", diff_WR),
+                                    `p-value` = sprintf("%.3f", p_value)),
+            by = "Variable")
+
+write.csv(table_3_10, file.path(results_tables, "table_3_10_baseline_diffs.csv"),
+          row.names = FALSE)
+cat("  Table 3.10 saved.\n")
+
+# *********************************************************
+#  5. Prepare estimation sample (restrict to ±5 years)    #
+# *********************************************************
+
+cat("--- 5. Preparing estimation sample ---\n")
+
+df_est <- df_analysis2 %>%
+  filter(ano %in% 2015:2022) %>%
+  mutate(
+    inov_ano_inc = ifelse(sample == 1, inov_ano_inc, 100000L)
+  ) %>%
+  filter(sample %in% c(2, 3) | abs(ano - inov_ano_inc) <= 5)
+
+cat("  Estimation sample rows:", nrow(df_est), "\n")
+cat("  Treated firm-year obs:", sum(df_est$sample == 1), "\n")
+cat("  Rejected firm-year obs:", sum(df_est$sample == 2), "\n")
+cat("  Never-applicant firm-year obs:", sum(df_est$sample == 3), "\n")
+
+# *********************************************************
+#         6. PANEL A: All non-treated as controls         #
+# *********************************************************
+
+cat("--- 6. Panel A regressions ---\n")
+
+run_panel <- function(dat, suffix, controls = "", results_tables, results_figures) {
+  # Build formulas
+  ctrl_str <- if (nchar(controls) > 0) paste0(" + ", controls) else ""
+  
+  specs <- list(
+    int_export   = list(dv = "int_export",         log = FALSE),
+    totExports   = list(dv = "totExports",          log = TRUE),
+    fixed_assets = list(dv = "fixed_assets",        log = TRUE),
+    sales        = list(dv = "VF16132",             log = TRUE),
+    wages        = list(dv = "VF15557",             log = TRUE),
+    employment   = list(dv = "employess_pos",       log = TRUE),
+    labor_prod   = list(dv = "labor_prod",          log = TRUE),
+    kl_ratio     = list(dv = "kl_ratio",            log = TRUE)
+  )
+  
+  models <- lapply(specs, function(s) {
+    lhs <- if (s$log) paste0("log(", s$dv, ")") else s$dv
+    fml <- as.formula(paste0(lhs, " ~ sunab(inov_ano_inc, ano)",
+                             ctrl_str,
+                             " | tina + ano + district + setor2"))
+    feols(fml, data = dat, vcov = ~tina)
+  })
+  
+  # Wald pre-trend tests
+  wald_p <- sapply(models, function(m) {
+    out <- try(wald(m, keep = "^ano::-[1-5]"), silent = TRUE)
+    if (inherits(out, "try-error")) NA_real_ else round(out$p, 3)
+  })
+  
+  # Export table
+  etable(
+    models,
+    agg = "ATT",
+    style.tex = style.tex("AER"),
+    signif.code = c("***" = 0.01, "**" = 0.05, "*" = 0.1),
+    fitstat = ~ r2 + n,
+    extralines = list("Parallel Trends (p-value)" = wald_p),
+    tex = TRUE,
+    file = file.path(results_tables, paste0("did_", suffix, ".tex"))
+  )
+  
+  # Export event-study plots
+  plot_names <- c("intExports", "totExports", "assets", "sales",
+                  "wage", "emp", "laborProd", "KL")
+  for (i in seq_along(models)) {
+    fname <- paste0(plot_names[i], "_PT_", suffix, ".png")
+    png(file.path(results_figures, fname), width = 900, height = 600)
+    iplot(models[[i]], ref.line = TRUE, main = "",
+          xlab = "Time to treatment", cex.axis = 1.3, cex.lab = 1.4)
+    dev.off()
+  }
+  
+  cat("  Panel", suffix, "saved:", length(models), "models.\n")
+  invisible(models)
+}
+
+# Panel A: all firms, with time-varying controls (leverage + firm_size)
+models_A <- run_panel(
+  dat     = df_est,
+  suffix  = "panelA",
+  controls = "VF16358 + firm_size",
+  results_tables  = results_tables,
+  results_figures = results_figures
+)
+
+# *********************************************************
+#      7. PANEL B: Rejected applicants only               #
+# *********************************************************
+
+cat("--- 7. Panel B regressions ---\n")
+
+models_B <- run_panel(
+  dat     = df_est %>% filter(sample %in% c(1, 2)),
+  suffix  = "panelB",
+  controls = "",
+  results_tables  = results_tables,
+  results_figures = results_figures
+)
+
+# *********************************************************
+#      8. Pre-treatment features for matching / EBAL      #
+# *********************************************************
+
+cat("--- 8. Building pre-treatment features ---\n")
+
+.safe_log1  <- function(x) log(pmax(x, 1))
+.safe_mean  <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+.safe_slope <- function(y, x) {
+  ok <- is.finite(y) & is.finite(x)
+  if (sum(ok) < 2) return(0)
+  tryCatch(unname(coef(lm(y[ok] ~ x[ok]))[2]), error = function(e) 0)
+}
+
+app <- df_analysis2 %>%
+  filter(sample %in% c(1, 2)) %>%
+  mutate(t0      = as.integer(inov_ano_inc),
+         treated = as.integer(sample == 1)) %>%
+  filter(!is.na(t0))
+
+YEAR_MIN <- 2014L; YEAR_MAX <- 2022L
+
+pre_feats <- app %>%
+  group_by(tina) %>%
+  summarise(t0 = first(t0), .groups = "drop") %>%
+  inner_join(app, by = c("tina", "t0")) %>%
+  group_by(tina) %>%
+  mutate(setor2     = first(setor2),
+         district   = first(district),
+         firm_size0 = first(firm_size)) %>%
+  ungroup() %>%
+  mutate(pre_start = pmax(t0 - 3L, YEAR_MIN),
+         pre_end   = pmin(t0 - 1L, YEAR_MAX)) %>%
+  filter(ano >= pre_start & ano <= pre_end) %>%
+  arrange(tina, ano) %>%
+  group_by(tina, t0, setor2, district, firm_size0) %>%
+  summarise(
+    n_pre       = n(),
+    pre_lsales  = .safe_mean(.safe_log1(VF16132)),
+    pre_emp     = .safe_mean(pmax(employess, 1)),
+    pre_expint  = .safe_mean(int_export),
+    pre_lassets = .safe_mean(.safe_log1(fixed_assets)),
+    sl_lsales   = .safe_slope(.safe_log1(VF16132), ano),
+    .groups     = "drop"
+  ) %>%
+  inner_join(app %>% distinct(tina, treated, t0), by = c("tina", "t0")) %>%
+  mutate(
+    t0_bin = cut(t0, breaks = c(2014, 2016, 2018, 2022),
+                 labels = c("15-16", "17-18", "19-22"),
+                 include.lowest = TRUE, right = TRUE)
+  )
+
+cat("  Pre-features built for", nrow(pre_feats), "applicant firms.\n")
+
+# *********************************************************
+#        9. EBAL (entropy balancing)                      #
+# *********************************************************
+
+cat("--- 9. Entropy balancing ---\n")
+
+run_ebal <- function(df, use_slope = TRUE, standardize = TRUE) {
+  if (sum(df$treated == 1) == 0 || sum(df$treated == 0) == 0) return(NULL)
+  base_covs <- c("pre_lsales", "pre_emp", "pre_expint", "pre_lassets")
+  covs <- if (use_slope) c(base_covs, "sl_lsales") else base_covs
+  dat <- df
+  if (standardize) {
+    dat <- dat %>% mutate(across(all_of(covs), ~ as.numeric(scale(.)),
+                                 .names = "{.col}_std"))
+    covs <- paste0(covs, "_std")
+  }
+  fml <- reformulate(covs, response = "treated")
+  res <- tryCatch(weightit(fml, data = dat, method = "ebal", estimand = "ATT"),
+                  error = function(e) NULL)
+  if (is.null(res)) return(NULL)
+  out <- df %>% mutate(w = as.numeric(res$weights))
+  ctrl <- out$treated == 0 & is.finite(out$w)
+  if (any(ctrl)) {
+    cap <- quantile(out$w[ctrl], 0.99, na.rm = TRUE)
+    out$w[ctrl] <- pmin(out$w[ctrl], cap)
+  }
+  out$w[out$treated == 1] <- 1
+  out
+}
+
+assign_weights_by <- function(df, group_vars, use_slope = TRUE, standardize = TRUE) {
+  df %>%
+    group_by(across(all_of(group_vars))) %>%
+    group_modify(~ {
+      res <- run_ebal(.x, use_slope = use_slope, standardize = standardize)
+      if (is.null(res)) tibble() else res
+    }) %>%
+    ungroup() %>%
+    select(tina, w)
+}
+
+# Ladder of fallbacks
+w1 <- assign_weights_by(pre_feats, c("setor2", "t0_bin", "firm_size0"), TRUE, TRUE)
+missing1 <- pre_feats %>% anti_join(w1, by = "tina")
+w2 <- assign_weights_by(missing1, c("setor2", "t0_bin", "firm_size0"), FALSE, TRUE)
+missing2 <- missing1 %>% anti_join(w2, by = "tina")
+w3 <- assign_weights_by(missing2, c("setor2", "t0_bin"), TRUE, TRUE)
+missing3 <- missing2 %>% anti_join(w3, by = "tina")
+w4 <- assign_weights_by(missing3, c("setor2", "t0_bin"), FALSE, TRUE)
+
+ebal_weights <- bind_rows(w1, w2, w3, w4) %>% distinct(tina, .keep_all = TRUE)
+no_w <- pre_feats %>% anti_join(ebal_weights, by = "tina") %>% pull(tina)
+
+df_ebal <- df_est %>%
+  mutate(tina = as.character(tina)) %>%
+  inner_join(ebal_weights %>% mutate(tina = as.character(tina)), by = "tina") %>%
+  filter(!tina %in% no_w,
+         sample %in% c(1, 2)) %>%
+  mutate(
+    treated      = as.integer(sample == 1),
+    inov_ano_inc = ifelse(sample == 1, inov_ano_inc, 100000L)
+  )
+
+# Normalize: mean control weight = 1
+m_ctrl <- mean(df_ebal$w[df_ebal$treated == 0], na.rm = TRUE)
+if (is.finite(m_ctrl) && m_ctrl > 0) {
+  df_ebal$w <- ifelse(df_ebal$treated == 0, df_ebal$w / m_ctrl, 1)
+}
+
+ess_ctrl <- with(df_ebal, (sum(w[treated == 0])^2) / sum(w[treated == 0]^2))
+ess_trt  <- with(df_ebal, (sum(w[treated == 1])^2) / sum(w[treated == 1]^2))
+cat("  EBAL coverage:", n_distinct(df_ebal$tina), "firms\n")
+cat("  ESS (treated / control):", round(ess_trt, 1), "/", round(ess_ctrl, 1), "\n")
+
+# EBAL regressions
+run_weighted_panel <- function(dat, wvar, suffix, results_tables, results_figures) {
+  wcall <- as.formula(paste0("~", wvar))
+  
+  specs <- list(
+    int_export   = list(dv = "int_export",    log = FALSE),
+    totExports   = list(dv = "totExports",     log = TRUE),
+    fixed_assets = list(dv = "fixed_assets",   log = TRUE),
+    sales        = list(dv = "VF16132",        log = TRUE),
+    wages        = list(dv = "VF15557",        log = TRUE),
+    employment   = list(dv = "employess_pos",  log = TRUE),
+    labor_prod   = list(dv = "labor_prod",     log = TRUE),
+    kl_ratio     = list(dv = "kl_ratio",       log = TRUE)
+  )
+  
+  models <- lapply(specs, function(s) {
+    lhs <- if (s$log) paste0("log(", s$dv, ")") else s$dv
+    fml <- as.formula(paste0(lhs, " ~ sunab(inov_ano_inc, ano)",
+                             " | tina + ano + district + setor2"))
+    feols(fml, data = dat, vcov = ~tina, weights = wcall)
+  })
+  
+  wald_p <- sapply(models, function(m) {
+    out <- try(wald(m, keep = "^ano::-[1-5]"), silent = TRUE)
+    if (inherits(out, "try-error")) NA_real_ else round(out$p, 3)
+  })
+  
+  etable(models, agg = "ATT", style.tex = style.tex("AER"),
+         signif.code = c("***" = 0.01, "**" = 0.05, "*" = 0.1),
+         fitstat = ~ r2 + n,
+         extralines = list("Parallel Trends (p-value)" = wald_p),
+         tex = TRUE,
+         file = file.path(results_tables, paste0("did_", suffix, ".tex")))
+  
+  plot_names <- c("intExports", "totExports", "assets", "sales",
+                  "wage", "emp", "laborProd", "KL")
+  for (i in seq_along(models)) {
+    fname <- paste0(plot_names[i], "_PT_", suffix, ".png")
+    png(file.path(results_figures, fname), width = 900, height = 600)
+    iplot(models[[i]], ref.line = TRUE, main = "",
+          xlab = "Time to treatment", cex.axis = 1.3, cex.lab = 1.4)
+    dev.off()
+  }
+  
+  cat("  Panel", suffix, "saved:", length(models), "models.\n")
+  invisible(models)
+}
+
+models_ebal <- run_weighted_panel(
+  dat     = df_ebal,
+  wvar    = "w",
+  suffix  = "ebal",
+  results_tables  = results_tables,
+  results_figures = results_figures
+)
+
+# *********************************************************
+#        10. PSM (Panel C)                                #
+# *********************************************************
+
+cat("--- 10. Propensity score matching ---\n")
+
+set.seed(42)
+
+# Impute missing pre-treatment features within strata
+pre_feats_clean <- pre_feats %>%
+  group_by(setor2, t0_bin, firm_size0, treated) %>%
+  mutate(
+    pre_lsales  = ifelse(is.na(pre_lsales),  median(pre_lsales,  na.rm = TRUE), pre_lsales),
+    pre_emp     = ifelse(is.na(pre_emp),      median(pre_emp,     na.rm = TRUE), pre_emp),
+    pre_expint  = ifelse(is.na(pre_expint),   median(pre_expint,  na.rm = TRUE), pre_expint),
+    pre_lassets = ifelse(is.na(pre_lassets),  median(pre_lassets, na.rm = TRUE), pre_lassets),
+    sl_lsales   = ifelse(is.na(sl_lsales), 0, sl_lsales)
+  ) %>%
+  ungroup()
+
+ps_form <- treated ~ pre_lsales + pre_emp + pre_expint + pre_lassets + sl_lsales
+
+# PSM nearest-neighbor
+m_psm <- matchit(
+  ps_form,
+  data       = pre_feats_clean,
+  method     = "nearest",
+  distance   = "glm",
+  exact      = ~ t0_bin,
+  caliper    = 0.2,
+  std.caliper = TRUE,
+  ratio      = 2,
+  replace    = TRUE
+)
+
+# Balance diagnostics (print to log)
+cat("\n== PSM Balance ==\n")
+print(bal.tab(m_psm, un = TRUE, stats = c("m", "v"),
+              thresholds = c(m = 0.1, v = 2)))
+
+# ESS
+md <- match.data(m_psm)
+ess_trt_psm  <- (sum(md$weights[md$treated == 1])^2) / sum(md$weights[md$treated == 1]^2)
+ess_ctrl_psm <- (sum(md$weights[md$treated == 0])^2) / sum(md$weights[md$treated == 0]^2)
+cat("  PSM ESS (treated / control):", round(ess_trt_psm, 1), "/", round(ess_ctrl_psm, 1), "\n")
+
+# Merge weights to panel
+w_psm_df <- md[, c("tina", "weights")] %>%
+  distinct() %>%
+  rename(w_psm = weights)
+
+df_psm <- df_est %>%
+  mutate(tina = as.character(tina)) %>%
+  inner_join(w_psm_df %>% mutate(tina = as.character(tina)), by = "tina") %>%
+  filter(sample %in% c(1, 2)) %>%
+  mutate(
+    treated      = as.integer(sample == 1),
+    inov_ano_inc = ifelse(sample == 1, inov_ano_inc, 100000L)
+  )
+
+models_C <- run_weighted_panel(
+  dat     = df_psm,
+  wvar    = "w_psm",
+  suffix  = "panelC_psm",
+  results_tables  = results_tables,
+  results_figures = results_figures
+)
+
+# *********************************************************
+#   11. Combined LaTeX table (Panels A, B, C side by side)#
+# *********************************************************
+
+cat("--- 11. Combined results table ---\n")
+
+# For a combined table we extract ATT from each panel
+extract_att <- function(models, label) {
+  sapply(models, function(m) {
+    s <- summary(m, agg = "ATT")
+    coefs <- s$coeftable
+    att_row <- coefs[grep("ATT", rownames(coefs)), , drop = FALSE]
+    if (nrow(att_row) == 0) return(c(est = NA, se = NA, p = NA))
+    c(est = att_row[1, 1], se = att_row[1, 2], p = att_row[1, 4])
+  })
+}
+
+att_A <- extract_att(models_A, "Panel A")
+att_B <- extract_att(models_B, "Panel B")
+att_C <- extract_att(models_C, "Panel C")
+
+combined_att <- tibble(
+  Outcome  = names(models_A),
+  ATT_A    = sprintf("%.4f (%.4f)", att_A["est", ], att_A["se", ]),
+  ATT_B    = sprintf("%.4f (%.4f)", att_B["est", ], att_B["se", ]),
+  ATT_C    = sprintf("%.4f (%.4f)", att_C["est", ], att_C["se", ])
+)
+
+write.csv(combined_att, file.path(results_tables, "table_3_11_combined_ATT.csv"),
+          row.names = FALSE)
+cat("  Combined ATT table saved.\n")
+
+# *********************************************************
+#              12. Descriptives by group/year              #
+# *********************************************************
+
+cat("--- 12. Additional descriptives ---\n")
+
+key_vars <- c("totExports_real2015", "fixed_assets_real2015",
+              "VF15557_real2015", "employess", "int_export")
+
+key_by_group_year <- descriptive %>%
+  mutate(sample_f = factor(sample, levels = 1:3,
+                           labels = c("Winners", "Rejected", "Never applied"))) %>%
+  select(sample_f, ano, all_of(intersect(key_vars, names(.)))) %>%
+  pivot_longer(cols = -c(sample_f, ano), names_to = "variable", values_to = "value") %>%
+  group_by(sample_f, ano, variable) %>%
+  summarise(
+    mean   = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    sd     = sd(value, na.rm = TRUE),
+    n_obs  = sum(!is.na(value)),
+    .groups = "drop"
+  )
+
+write.csv(key_by_group_year, file.path(results_tables, "desc_by_group_year.csv"),
+          row.names = FALSE)
+cat("  Descriptives by group-year saved.\n")
+
+# *********************************************************
+#                    Wrap-up                               #
+# *********************************************************
+
+cat("\n=== All outputs generated ===\n")
+cat("Tables in:", results_tables, "\n")
+cat("Figures in:", results_figures, "\n")
+cat("Loaded packages:", paste(sort(loadedNamespaces()), collapse = ", "), "\n")
+
+sink()

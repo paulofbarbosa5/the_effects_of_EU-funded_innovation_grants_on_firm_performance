@@ -15,11 +15,11 @@ The repository is intended to make the empirical workflow transparent and to fac
 
 The code reproduces the main empirical outputs of the paper/chapter, including:
 
-- descriptive statistics for treated firms, rejected applicants, and never-applicants
-- baseline treatment-effect estimates
-- applicant-based event-study estimates
-- propensity-score-matched estimates
-- tables and figures reported in the paper
+- descriptive statistics for treated firms, rejected applicants, and never-applicants;
+- baseline treatment-effect estimates;
+- applicant-based event-study estimates;
+- propensity-score-matched estimates;
+- tables and figures reported in the paper.
 
 In particular, the workflow is designed to generate the main outputs for the innovation-grants essay / chapter of the thesis.
 
@@ -31,11 +31,9 @@ This project relies on **restricted-access confidential microdata** and is desig
 
 Because of that:
 
-- full replication is only possible for authorized users with access to the underlying data
-- external users can still inspect the code, identification strategy, and project structure
-- no confidential data are included in this repository
-
-Please do **not** expect the code to run end-to-end outside the authorized research environment unless equivalent data access and file paths are available.
+- full replication is only possible for authorized users with access to the underlying data;
+- external users can still inspect the code, identification strategy, and project structure;
+- no confidential data are included in this repository.
 
 ---
 
@@ -43,10 +41,10 @@ Please do **not** expect the code to run end-to-end outside the authorized resea
 
 A typical workflow uses the following components:
 
-- `README.md` — project overview and setup instructions
-- `config/` — local configuration files and path definitions
-- `code/` — main analysis script(s)
-- `outputs/` — exported tables, figures, and intermediate results created during execution
+- `README.md` — project overview and setup instructions;
+- `config/` — local configuration files and path definitions;
+- `code/` — main analysis script(s);
+- `outputs/` — exported tables, figures, and intermediate results created during execution,
 
 Adjust the folder names below if your local version differs.
 
